@@ -11,6 +11,7 @@ interface FaceResult {
 
 interface FaceSwapResult {
   base64: string;  // 合成結果画像
+  color_correction_strength: number;  // 使用された色補正強度
 }
 
 function App() {
@@ -27,7 +28,7 @@ function App() {
   const [targetPreview, setTargetPreview] = useState<string>("");
   const [swapResult, setSwapResult] = useState<string>("");
   const [swapping, setSwapping] = useState<boolean>(false);
-  const [colorCorrection, setColorCorrection] = useState<number>(0.5); // 色補正強度 (0-1)
+  const [colorCorrection, setColorCorrection] = useState<number | null>(null); // 色補正強度 (0-1)、nullの場合は自動
 
   const selectAndProcess = async () => {
     const file = await open({
@@ -87,9 +88,11 @@ function App() {
       const result = await invoke<FaceSwapResult>("face_swap", { 
         sourcePath, 
         targetPath,
-        colorCorrection
+        colorCorrection: colorCorrection !== null ? colorCorrection : undefined
       });
       setSwapResult(result.base64);
+      // 自動計算された色補正強度をスライダーに反映
+      setColorCorrection(result.color_correction_strength);
     } catch (e) {
       console.error(e);
       alert("Face Swapに失敗しました: " + e);
@@ -204,7 +207,7 @@ function App() {
                 <span className="text-xl">🎨</span> 色補正の強度
               </label>
               <span className="px-3 py-1 bg-cyan-500/20 border border-cyan-500/30 rounded-full text-cyan-400 font-mono text-sm font-bold">
-                {Math.round(colorCorrection * 100)}%
+                {colorCorrection !== null ? Math.round(colorCorrection * 100) + '%' : '自動'}
               </span>
             </div>
             <div className="relative">
@@ -212,7 +215,7 @@ function App() {
                 type="range"
                 min="0"
                 max="100"
-                value={colorCorrection * 100}
+                value={colorCorrection !== null ? colorCorrection * 100 : 50}
                 onChange={(e) => setColorCorrection(Number(e.target.value) / 100)}
                 className="w-full h-3 bg-slate-700/50 rounded-full appearance-none cursor-pointer accent-cyan-500 
                   [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5 

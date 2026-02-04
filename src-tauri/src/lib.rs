@@ -136,8 +136,32 @@ fn create_high_quality_mask(img: &core::Mat, rect: core::Rect) -> Result<core::M
     let mut bgd = core::Mat::default();
     let mut fgd = core::Mat::default();
 
-    // GrabCut実行（反復回数を増やして精度向上）
-    imgproc::grab_cut(img, &mut mask, rect, &mut bgd, &mut fgd, 5, imgproc::GC_INIT_WITH_RECT).map_err(|e| e.to_string())?;
+    // 前処理: ノイズ除去とコントラスト調整（より強力に）
+    let mut preprocessed = core::Mat::default();
+    // バイラテラルフィルタでエッジを保持しつつノイズ除去
+    imgproc::bilateral_filter(img, &mut preprocessed, 15, 100.0, 100.0, core::BORDER_DEFAULT).map_err(|e| e.to_string())?;
+    
+    // コントラスト強調（CLAHE）
+    let mut lab = core::Mat::default();
+    imgproc::cvt_color(&preprocessed, &mut lab, imgproc::COLOR_BGR2Lab, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+    
+    let mut channels = core::Vector::<core::Mat>::new();
+    core::split(&lab, &mut channels).map_err(|e| e.to_string())?;
+    
+    let l_channel = channels.get(0).map_err(|e| e.to_string())?;
+    let mut clahe_output = core::Mat::default();
+    let mut clahe = imgproc::create_clahe(2.0, core::Size::new(8, 8)).map_err(|e| e.to_string())?;
+    clahe.apply(&l_channel, &mut clahe_output).map_err(|e| e.to_string())?;
+    channels.set(0, clahe_output).map_err(|e| e.to_string())?;
+    
+    let mut enhanced_lab = core::Mat::default();
+    core::merge(&channels, &mut enhanced_lab).map_err(|e| e.to_string())?;
+    
+    let mut enhanced = core::Mat::default();
+    imgproc::cvt_color(&enhanced_lab, &mut enhanced, imgproc::COLOR_Lab2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+
+    // GrabCut実行（反復回数を大幅に増やして精度最大化）
+    imgproc::grab_cut(&enhanced, &mut mask, rect, &mut bgd, &mut fgd, 25, imgproc::GC_INIT_WITH_RECT).map_err(|e| e.to_string())?;
 
     let mut mask_fg = core::Mat::default();
     let mut mask_pr = core::Mat::default();
@@ -146,20 +170,33 @@ fn create_high_quality_mask(img: &core::Mat, rect: core::Rect) -> Result<core::M
     let mut bin = core::Mat::default();
     core::bitwise_or(&mask_fg, &mask_pr, &mut bin, &core::Mat::default()).map_err(|e| e.to_string())?;
 
-    // モルフォロジー演算でノイズ除去（最小限の処理）
+    // モルフォロジー演算を強化してより精密に
     let mut temp = core::Mat::default();
-    let k_open = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(3, 3), core::Point::new(-1, -1)).map_err(|e| e.to_string())?;
-    imgproc::morphology_ex(&bin, &mut temp, imgproc::MORPH_OPEN, &k_open, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, core::Scalar::default()).map_err(|e| e.to_string())?;
+    let k_open = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(5, 5), core::Point::new(-1, -1)).map_err(|e| e.to_string())?;
+    imgproc::morphology_ex(&bin, &mut temp, imgproc::MORPH_OPEN, &k_open, core::Point::new(-1, -1), 2, core::BORDER_CONSTANT, core::Scalar::default()).map_err(|e| e.to_string())?;
     
     let mut closed = core::Mat::default();
-    let k_close = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(5, 5), core::Point::new(-1, -1)).map_err(|e| e.to_string())?;
-    imgproc::morphology_ex(&temp, &mut closed, imgproc::MORPH_CLOSE, &k_close, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, core::Scalar::default()).map_err(|e| e.to_string())?;
+    let k_close = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(7, 7), core::Point::new(-1, -1)).map_err(|e| e.to_string())?;
+    imgproc::morphology_ex(&temp, &mut closed, imgproc::MORPH_CLOSE, &k_close, core::Point::new(-1, -1), 2, core::BORDER_CONSTANT, core::Scalar::default()).map_err(|e| e.to_string())?;
     
-    // マスクのエッジのみを滑らかに（最小限のガウシアンブラー）
-    let mut smooth = core::Mat::default();
-    imgproc::gaussian_blur(&closed, &mut smooth, core::Size::new(3, 3), 0.5, 0.0, core::BORDER_DEFAULT, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+    // エッジを精緻化（距離変換で滑らかに）
+    let mut dist = core::Mat::default();
+    imgproc::distance_transform(&closed, &mut dist, imgproc::DIST_L2, 3, core::CV_32F).map_err(|e| e.to_string())?;
     
-    Ok(smooth)
+    // 距離変換を正規化
+    let mut normalized = core::Mat::default();
+    core::normalize(&dist, &mut normalized, 0.0, 255.0, core::NORM_MINMAX, core::CV_8U, &core::Mat::default()).map_err(|e| e.to_string())?;
+    
+    // 閾値処理でクリーンなマスクを作成
+    let mut thresholded = core::Mat::default();
+    imgproc::threshold(&normalized, &mut thresholded, 10.0, 255.0, imgproc::THRESH_BINARY).map_err(|e| e.to_string())?;
+    
+    // 元のマスクと組み合わせて最適化
+    let mut final_mask = core::Mat::default();
+    core::bitwise_and(&closed, &thresholded, &mut final_mask, &core::Mat::default()).map_err(|e| e.to_string())?;
+    
+    // ボカシは最小限に（髭の細部を保持）
+    Ok(final_mask)
 }
 
 fn apply_mask_and_encode_parallel(img: &core::Mat, mask: &core::Mat) -> Result<String, String> {
@@ -217,15 +254,13 @@ fn greet(name: &str) -> String {
 #[derive(serde::Serialize)]
 struct FaceSwapResult {
     base64: String,  // 合成結果画像
+    color_correction_strength: f64,  // 使用された色補正強度（0.0-1.0）
 }
 
 #[tauri::command]
 fn face_swap(source_path: String, target_path: String, color_correction: Option<f64>) -> Result<FaceSwapResult, String> {
     opencv::core::set_use_optimized(true).ok();
     opencv::core::set_num_threads(0).ok();
-
-    // 色補正強度（デフォルト: 50%）
-    let correction_strength = color_correction.unwrap_or(0.5);
 
     // 画像読み込み
     let source_img = imgcodecs::imread(&source_path, imgcodecs::IMREAD_COLOR)
@@ -257,6 +292,13 @@ fn face_swap(source_path: String, target_path: String, color_correction: Option<
     let mut target_face_img = core::Mat::default();
     target_face_roi.copy_to(&mut target_face_img).map_err(|e| e.to_string())?;
 
+    // 色補正強度を自動計算（肌色の差に基づく）
+    let auto_correction_strength = if color_correction.is_none() {
+        calculate_color_correction_strength(&source_face_img, &target_face_img)?
+    } else {
+        color_correction.unwrap()
+    };
+
     // ソース顔をターゲット顔のサイズにリサイズ
     let mut resized_face = core::Mat::default();
     imgproc::resize(
@@ -269,7 +311,7 @@ fn face_swap(source_path: String, target_path: String, color_correction: Option<
 
     // 色補正: ソース顔の色をターゲット顔に合わせる
     let mut color_corrected = core::Mat::default();
-    match_color(&resized_face, &target_face_img, &mut color_corrected, correction_strength)?;;
+    match_color(&resized_face, &target_face_img, &mut color_corrected, auto_correction_strength)?;
 
     // 楽円マスクを作成（顔全体を滑らかに合成）
     let mask = create_ellipse_mask(target_face.width, target_face.height)?;
@@ -287,6 +329,7 @@ fn face_swap(source_path: String, target_path: String, color_correction: Option<
 
     Ok(FaceSwapResult {
         base64: general_purpose::STANDARD.encode(buf.as_slice()),
+        color_correction_strength: auto_correction_strength,
     })
 }
 
@@ -311,7 +354,7 @@ fn extract_face_with_mask(img: &core::Mat, face: &core::Rect) -> Result<(core::M
     // ヒント枠
     let hint_margin_x = (face.width as f32 * 0.15) as i32;
     let hint_margin_top = (face.height as f32 * 0.05) as i32;
-    let hint_margin_bottom = (face.height as f32 * 0.3) as i32;
+    let hint_margin_bottom = (face.height as f32 * 0.15) as i32;  // 顧を含めるたも30%から15%に減少
     
     let hint_x = hint_margin_x;
     let hint_y = hint_margin_top;
@@ -351,19 +394,58 @@ fn create_ellipse_mask(width: i32, height: i32) -> Result<core::Mat, String> {
         0
     ).map_err(|e| e.to_string())?;
 
-    // エッジを軽くぼかす（髪との境界を自然に、でも上書きを防ぐ）
+    // エッジを最小限にぼかす（境界を自然に）
     let mut smooth_mask = core::Mat::default();
     imgproc::gaussian_blur(
         &mask,
         &mut smooth_mask,
         core::Size::new(5, 5),
-        2.0,
+        1.5,
         0.0,
         core::BORDER_DEFAULT,
         core::AlgorithmHint::ALGO_HINT_DEFAULT
     ).map_err(|e| e.to_string())?;
 
     Ok(smooth_mask)
+}
+
+// 肌色の差に基づいて色補正強度を自動計算
+fn calculate_color_correction_strength(src: &core::Mat, target: &core::Mat) -> Result<f64, String> {
+    // 肌色を抽出（YCrCbカラースペース使用）
+    let mut src_ycrcb = core::Mat::default();
+    let mut target_ycrcb = core::Mat::default();
+    imgproc::cvt_color(src, &mut src_ycrcb, imgproc::COLOR_BGR2YCrCb, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+    imgproc::cvt_color(target, &mut target_ycrcb, imgproc::COLOR_BGR2YCrCb, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+
+    // 肌色範囲でマスクを作成clahe
+    let mut src_skin_mask = core::Mat::default();
+    let mut target_skin_mask = core::Mat::default();
+    let lower_skin = core::Scalar::new(0.0, 133.0, 77.0, 0.0);
+    let upper_skin = core::Scalar::new(255.0, 173.0, 127.0, 0.0);
+    
+    core::in_range(&src_ycrcb, &lower_skin, &upper_skin, &mut src_skin_mask).map_err(|e| e.to_string())?;
+    core::in_range(&target_ycrcb, &lower_skin, &upper_skin, &mut target_skin_mask).map_err(|e| e.to_string())?;
+
+    // 肌色領域の平均色を計算
+    let src_skin_mean = core::mean(src, &src_skin_mask).map_err(|e| e.to_string())?;
+    let target_skin_mean = core::mean(target, &target_skin_mask).map_err(|e| e.to_string())?;
+
+    // 色の差を計算（ユークリッド距離）
+    let color_diff = (
+        (target_skin_mean[0] - src_skin_mean[0]).powi(2) +
+        (target_skin_mean[1] - src_skin_mean[1]).powi(2) +
+        (target_skin_mean[2] - src_skin_mean[2]).powi(2)
+    ).sqrt();
+
+    // 色差に基づいて補正強度を決定（差が大きいほど強く補正）
+    // 双曲線関数を使用: strength = max_strength * color_diff / (color_diff + k)
+    // これにより滑らかな曲線で強度が増加し、最終的に飽和する
+    let max_strength = 0.7;  // 最大強度70%
+    let k = 40.0;  // この値で強度カーブの傾きを調整（色差40で約半分の強度）
+    
+    let strength = max_strength * color_diff / (color_diff + k);
+
+    Ok(strength)
 }
 
 // 色補正: ソース画像の肌色をターゲット画像の肌色に合わせる
@@ -397,7 +479,7 @@ fn match_color(src: &core::Mat, target: &core::Mat, dst: &mut core::Mat, strengt
     // 変換後の画像を作成
     src.copy_to(dst).map_err(|e| e.to_string())?;
     
-    // 各ピクセルに色差分を加算
+    // 色差分を加算（輝度補正は削除して色シフトのみ）
     let mut dst_f32 = core::Mat::default();
     dst.convert_to(&mut dst_f32, core::CV_32F, 1.0, 0.0).map_err(|e| e.to_string())?;
     
