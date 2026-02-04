@@ -29,6 +29,7 @@ function App() {
   const [swapResult, setSwapResult] = useState<string>("");
   const [swapping, setSwapping] = useState<boolean>(false);
   const [colorCorrection, setColorCorrection] = useState<number | null>(null); // 色補正強度 (0-1)、nullの場合は自動
+  const [manualMode, setManualMode] = useState<boolean>(false); // 手動モードのオン/オフ
 
   const selectAndProcess = async () => {
     const file = await open({
@@ -88,7 +89,8 @@ function App() {
       const result = await invoke<FaceSwapResult>("face_swap", { 
         sourcePath, 
         targetPath,
-        colorCorrection: colorCorrection !== null ? colorCorrection : undefined
+        // 手動モードの時だけスライダーの値を使用、それ以外は自動計算
+        colorCorrection: manualMode && colorCorrection !== null ? colorCorrection : undefined
       });
       setSwapResult(result.base64);
       // 自動計算された色補正強度をスライダーに反映
@@ -206,9 +208,21 @@ function App() {
               <label className="text-sm sm:text-base font-bold text-slate-200 flex items-center gap-2">
                 <span className="text-xl">🎨</span> 色補正の強度
               </label>
-              <span className="px-3 py-1 bg-cyan-500/20 border border-cyan-500/30 rounded-full text-cyan-400 font-mono text-sm font-bold">
-                {colorCorrection !== null ? Math.round(colorCorrection * 100) + '%' : '自動'}
-              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setManualMode(!manualMode)}
+                  className={
+                    manualMode 
+                      ? 'px-3 py-1 rounded-full text-xs font-bold transition-all bg-purple-500/30 border border-purple-500/50 text-purple-300' 
+                      : 'px-3 py-1 rounded-full text-xs font-bold transition-all bg-cyan-500/20 border border-cyan-500/30 text-cyan-400'
+                  }
+                >
+                  {manualMode ? '🔧 手動' : '✨ 自動'}
+                </button>
+                <span className="px-3 py-1 bg-cyan-500/20 border border-cyan-500/30 rounded-full text-cyan-400 font-mono text-sm font-bold">
+                  {colorCorrection !== null ? `${Math.round(colorCorrection * 100)}%` : '-'}
+                </span>
+              </div>
             </div>
             <div className="relative">
               <input
@@ -217,13 +231,12 @@ function App() {
                 max="100"
                 value={colorCorrection !== null ? colorCorrection * 100 : 50}
                 onChange={(e) => setColorCorrection(Number(e.target.value) / 100)}
-                className="w-full h-3 bg-slate-700/50 rounded-full appearance-none cursor-pointer accent-cyan-500 
-                  [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5 
-                  [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-gradient-to-r 
-                  [&::-webkit-slider-thumb]:from-cyan-400 [&::-webkit-slider-thumb]:to-blue-500 
-                  [&::-webkit-slider-thumb]:shadow-lg [&::-webkit-slider-thumb]:shadow-cyan-500/50
-                  [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:hover:scale-110
-                  [&::-webkit-slider-thumb]:transition-transform"
+                disabled={!manualMode}
+                className={
+                  manualMode 
+                    ? 'w-full h-3 bg-slate-700/50 rounded-full appearance-none cursor-pointer accent-cyan-500 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-gradient-to-r [&::-webkit-slider-thumb]:from-cyan-400 [&::-webkit-slider-thumb]:to-blue-500 [&::-webkit-slider-thumb]:shadow-lg [&::-webkit-slider-thumb]:shadow-cyan-500/50 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:hover:scale-110 [&::-webkit-slider-thumb]:transition-transform' 
+                    : 'w-full h-3 bg-slate-700/50 rounded-full appearance-none cursor-not-allowed opacity-50 accent-cyan-500 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-gradient-to-r [&::-webkit-slider-thumb]:from-cyan-400 [&::-webkit-slider-thumb]:to-blue-500 [&::-webkit-slider-thumb]:shadow-lg [&::-webkit-slider-thumb]:shadow-cyan-500/50 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:hover:scale-110 [&::-webkit-slider-thumb]:transition-transform'
+                }
               />
             </div>
             <div className="flex justify-between text-xs text-slate-500 mt-3 px-1">
