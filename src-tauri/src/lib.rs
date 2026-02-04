@@ -220,9 +220,12 @@ struct FaceSwapResult {
 }
 
 #[tauri::command]
-fn face_swap(source_path: String, target_path: String) -> Result<FaceSwapResult, String> {
+fn face_swap(source_path: String, target_path: String, color_correction: Option<f64>) -> Result<FaceSwapResult, String> {
     opencv::core::set_use_optimized(true).ok();
     opencv::core::set_num_threads(0).ok();
+
+    // 色補正強度（デフォルト: 50%）
+    let correction_strength = color_correction.unwrap_or(0.5);
 
     // 画像読み込み
     let source_img = imgcodecs::imread(&source_path, imgcodecs::IMREAD_COLOR)
@@ -266,7 +269,7 @@ fn face_swap(source_path: String, target_path: String) -> Result<FaceSwapResult,
 
     // 色補正: ソース顔の色をターゲット顔に合わせる
     let mut color_corrected = core::Mat::default();
-    match_color(&resized_face, &target_face_img, &mut color_corrected)?;
+    match_color(&resized_face, &target_face_img, &mut color_corrected, correction_strength)?;;
 
     // 楽円マスクを作成（顔全体を滑らかに合成）
     let mask = create_ellipse_mask(target_face.width, target_face.height)?;
@@ -364,7 +367,7 @@ fn create_ellipse_mask(width: i32, height: i32) -> Result<core::Mat, String> {
 }
 
 // 色補正: ソース画像の肌色をターゲット画像の肌色に合わせる
-fn match_color(src: &core::Mat, target: &core::Mat, dst: &mut core::Mat) -> Result<(), String> {
+fn match_color(src: &core::Mat, target: &core::Mat, dst: &mut core::Mat, strength: f64) -> Result<(), String> {
     // 肌色を抽出（YCrCbカラースペース使用）
     let mut src_ycrcb = core::Mat::default();
     let mut target_ycrcb = core::Mat::default();
@@ -384,11 +387,11 @@ fn match_color(src: &core::Mat, target: &core::Mat, dst: &mut core::Mat) -> Resu
     let src_skin_mean = core::mean(src, &src_skin_mask).map_err(|e| e.to_string())?;
     let target_skin_mean = core::mean(target, &target_skin_mask).map_err(|e| e.to_string())?;
 
-    // 肌色の差分を計算（40%の強度で穏やかに補正）
+    // 肌色の差分を計算（strengthで補正強度を調整）
     let color_shift = [
-        (target_skin_mean[0] - src_skin_mean[0]) * 0.4,
-        (target_skin_mean[1] - src_skin_mean[1]) * 0.4,
-        (target_skin_mean[2] - src_skin_mean[2]) * 0.4,
+        (target_skin_mean[0] - src_skin_mean[0]) * strength,
+        (target_skin_mean[1] - src_skin_mean[1]) * strength,
+        (target_skin_mean[2] - src_skin_mean[2]) * strength,
     ];
 
     // 変換後の画像を作成
