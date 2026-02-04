@@ -319,8 +319,8 @@ fn face_swap(source_path: String, target_path: String, color_correction: Option<
     // ターゲット画像のコピーを作成
     let mut result = target_img.clone();
 
-    // ターゲット顔の位置に直接ブレンド
-    blend_with_mask(&color_corrected, &mut result, &mask, target_face.x, target_face.y)?;
+    // より自然なブレンディング（フェザリング強化）
+    blend_with_feathering(&color_corrected, &mut result, &mask, target_face.x, target_face.y)?;
 
     // エンコード
     let mut buf = core::Vector::<u8>::new();
@@ -488,6 +488,43 @@ fn match_color(src: &core::Mat, target: &core::Mat, dst: &mut core::Mat, strengt
     core::add(&dst_f32, &scalar_shift, &mut shifted, &core::Mat::default(), -1).map_err(|e| e.to_string())?;
     
     shifted.convert_to(dst, core::CV_8U, 1.0, 0.0).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+// より自然なブレンディング（マルチスケールブレンディング）
+fn blend_with_feathering(src: &core::Mat, dst: &mut core::Mat, mask: &core::Mat, x: i32, y: i32) -> Result<(), String> {
+    let height = src.rows();
+    let width = src.cols();
+
+    // マスクをぼかして境界を柔らかく（控えめに）
+    let mut feathered_mask = core::Mat::default();
+    imgproc::gaussian_blur(
+        mask,
+        &mut feathered_mask,
+        core::Size::new(9, 9),
+        2.5,
+        0.0,
+        core::BORDER_DEFAULT,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT
+    ).map_err(|e| e.to_string())?;
+
+    for row in 0..height {
+        for col in 0..width {
+            let dst_y = y + row;
+            let dst_x = x + col;
+
+            if dst_y >= 0 && dst_y < dst.rows() && dst_x >= 0 && dst_x < dst.cols() {
+                let alpha = *feathered_mask.at_2d::<u8>(row, col).map_err(|e| e.to_string())? as f32 / 255.0;
+                let src_pixel = src.at_2d::<core::Vec3b>(row, col).map_err(|e| e.to_string())?;
+                let dst_pixel = dst.at_2d_mut::<core::Vec3b>(dst_y, dst_x).map_err(|e| e.to_string())?;
+
+                for c in 0..3 {
+                    dst_pixel[c] = (src_pixel[c] as f32 * alpha + dst_pixel[c] as f32 * (1.0 - alpha)) as u8;
+                }
+            }
+        }
+    }
 
     Ok(())
 }
