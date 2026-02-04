@@ -331,7 +331,8 @@ fn create_ellipse_mask(width: i32, height: i32) -> Result<core::Mat, String> {
     ).map_err(|e| e.to_string())?;
 
     let center = core::Point::new(width / 2, height / 2);
-    let axes = core::Size::new((width as f32 * 0.42) as i32, (height as f32 * 0.42) as i32);
+    // 楕円を縦長にして髪への侵食を防ぐ（横幅を狭く、縦はそのまま）
+    let axes = core::Size::new((width as f32 * 0.40) as i32, (height as f32 * 0.48) as i32);
     
     // 白い楽円を描画
     imgproc::ellipse(
@@ -347,13 +348,13 @@ fn create_ellipse_mask(width: i32, height: i32) -> Result<core::Mat, String> {
         0
     ).map_err(|e| e.to_string())?;
 
-    // エッジを適度にぼかす（境界を自然に）
+    // エッジを軽くぼかす（髪との境界を自然に、でも上書きを防ぐ）
     let mut smooth_mask = core::Mat::default();
     imgproc::gaussian_blur(
         &mask,
         &mut smooth_mask,
-        core::Size::new(7, 7),
-        3.0,
+        core::Size::new(5, 5),
+        2.0,
         0.0,
         core::BORDER_DEFAULT,
         core::AlgorithmHint::ALGO_HINT_DEFAULT
