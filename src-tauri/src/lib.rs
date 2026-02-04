@@ -4,21 +4,23 @@ use opencv::{
     imgproc,
     objdetect,
     prelude::*,
-    //types,
 };
 use base64::{Engine as _, engine::general_purpose};
 use rayon::prelude::*;
 
+#[derive(serde::Serialize)]
+struct FaceResult {
+    base64: String,       // 切り抜き後の透過画像
+    debug_base64: String, // 青枠と赤枠を描画した確認用画像
+}
+
 #[tauri::command]
-fn process_face(path: String) -> Result<Vec<String>, String> {
-    println!("process_face() invoked: Single-Image Multi-Core Attack");
+fn process_face(path: String) -> Result<Vec<FaceResult>, String> { // 戻り値の型を変更
+    println!("process_face() invoked: Debug Mode");
 
-    // --- ★1. OpenCVに「持てる力の全てを出せ」と命令する ---
-    // これでGrabCut内部の行列計算などが（可能な範囲で）並列化されます
     opencv::core::set_use_optimized(true).ok();
-    opencv::core::set_num_threads(0).ok(); // 0 = システムの全コアを使う
+    opencv::core::set_num_threads(0).ok();
 
-    // 1. 画像読み込み
     let img = imgcodecs::imread(&path, imgcodecs::IMREAD_COLOR)
         .map_err(|_| "画像の読み込みに失敗")?;
 
@@ -29,11 +31,11 @@ fn process_face(path: String) -> Result<Vec<String>, String> {
         return Err("顔が検出されませんでした".to_string());
     }
 
-    // ここは複数人の並列処理（前回と同じ）
-    let results: Result<Vec<String>, String> = faces_vec.par_iter().map(|face| {
+    // 並列処理
+    let results: Result<Vec<FaceResult>, String> = faces_vec.par_iter().map(|face| {
         let img_size = img.size().map_err(|e| e.to_string())?;
 
-        // --- キャンバス確保 ---
+        // 1. キャンバス確保 (margin設定)
         let canvas_margin_top = (face.height as f32 * 1.5) as i32;
         let canvas_margin_bottom = (face.height as f32 * 0.2) as i32;
         let canvas_margin_side = (face.width as f32 * 1.5) as i32;
@@ -50,28 +52,60 @@ fn process_face(path: String) -> Result<Vec<String>, String> {
         let mut work_img = core::Mat::default();
         canvas_roi.copy_to(&mut work_img).map_err(|e| e.to_string())?;
 
-        // --- ヒント枠 ---
+        // 2. ヒント枠 (AI探索範囲)
         let border = 2;
         let hint_w = (work_img.cols() - (border as f32 * 0.1) as i32).max(1);
         let neck_exclude_px = (face.height as f32 * 0.2) as i32; 
         let hint_h = (work_img.rows() - border - neck_exclude_px).max(1);
         let hint_rect = core::Rect::new(border, border, hint_w, hint_h);
 
-        // --- マスク生成 (GrabCut) ---
-        // ※ここはアルゴリズムの性質上、どうしても1コア集中になりがちですが、
-        // 冒頭の set_num_threads(0) が効く部分は効きます。
+        // --- ★ここが追加: デバッグ画像の作成 ---
+        let mut debug_img = work_img.clone();
+
+        // (A) 青い枠: 顔検出の結果 (Haar Cascade)
+        // Global座標からCanvas相対座標に変換
+        let face_rel_x = face.x - canvas_x;
+        let face_rel_y = face.y - canvas_y;
+        let face_rel_rect = core::Rect::new(face_rel_x, face_rel_y, face.width, face.height);
+        
+        imgproc::rectangle(
+            &mut debug_img,
+            face_rel_rect,
+            core::Scalar::new(255.0, 0.0, 0.0, 0.0), // BGRなので青(255,0,0)
+            2, imgproc::LINE_8, 0
+        ).map_err(|e| e.to_string())?;
+
+        // (B) 赤い枠: AIの探索範囲 (GrabCut Hint)
+        imgproc::rectangle(
+            &mut debug_img,
+            hint_rect,
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0), // BGRなので赤(0,0,255)
+            2, imgproc::LINE_8, 0
+        ).map_err(|e| e.to_string())?;
+
+        // デバッグ画像のエンコード (JPEGで軽く済ます)
+        let mut debug_buf = core::Vector::<u8>::new();
+        imgcodecs::imencode(".jpg", &debug_img, &mut debug_buf, &core::Vector::new())
+            .map_err(|e| e.to_string())?;
+        let debug_base64 = general_purpose::STANDARD.encode(debug_buf.as_slice());
+
+        // ------------------------------------
+
+        // 3. マスク生成 (GrabCut)
         let mask = create_high_quality_mask(&work_img, hint_rect)?;
 
-        // --- ★2. 最後の仕上げ処理を全コアで殴る ---
-        // apply_mask_and_encode_parallel という新関数を作りました
+        // 4. 仕上げ処理
         let base64_img = apply_mask_and_encode_parallel(&work_img, &mask)?;
 
-        Ok(base64_img)
+        // 結果をセットで返す
+        Ok(FaceResult {
+            base64: base64_img,
+            debug_base64: debug_base64,
+        })
     }).collect();
 
     results
 }
-
 
 fn detect_faces(img: &core::Mat) -> Result<core::Vector<core::Rect>, String> {
     let mut face_detector = objdetect::CascadeClassifier::new("haarcascade_frontalface_default.xml")
