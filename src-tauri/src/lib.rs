@@ -309,9 +309,13 @@ fn face_swap(source_path: String, target_path: String, color_correction: Option<
         imgproc::INTER_LANCZOS4
     ).map_err(|e| e.to_string())?;
 
+    // 照明補正: ヒストグラムマッチングで明暗を合わせる
+    let mut illumination_matched = core::Mat::default();
+    match_illumination(&resized_face, &target_face_img, &mut illumination_matched)?;
+
     // 色補正: ソース顔の色をターゲット顔に合わせる
     let mut color_corrected = core::Mat::default();
-    match_color(&resized_face, &target_face_img, &mut color_corrected, auto_correction_strength)?;
+    match_color(&illumination_matched, &target_face_img, &mut color_corrected, auto_correction_strength)?;
 
     // 楽円マスクを作成（顔全体を滑らかに合成）
     let mask = create_ellipse_mask(target_face.width, target_face.height)?;
@@ -448,6 +452,66 @@ fn calculate_color_correction_strength(src: &core::Mat, target: &core::Mat) -> R
     Ok(strength)
 }
 
+// 照明補正: ヒストグラムマッチングで明暗を合わせる
+fn match_illumination(src: &core::Mat, target: &core::Mat, dst: &mut core::Mat) -> Result<(), String> {
+    // LAB色空間に変換（L: 輝度、A/B: 色相）
+    let mut src_lab = core::Mat::default();
+    let mut target_lab = core::Mat::default();
+    imgproc::cvt_color(src, &mut src_lab, imgproc::COLOR_BGR2Lab, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+    imgproc::cvt_color(target, &mut target_lab, imgproc::COLOR_BGR2Lab, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+
+    // チャンネル分離
+    let mut src_channels = core::Vector::<core::Mat>::new();
+    let mut target_channels = core::Vector::<core::Mat>::new();
+    core::split(&src_lab, &mut src_channels).map_err(|e| e.to_string())?;
+    core::split(&target_lab, &mut target_channels).map_err(|e| e.to_string())?;
+
+    // L（輝度）チャンネルの統計を取得
+    let src_l = src_channels.get(0).map_err(|e| e.to_string())?;
+    let target_l = target_channels.get(0).map_err(|e| e.to_string())?;
+    
+    let mut src_mean = core::Scalar::default();
+    let mut src_stddev = core::Scalar::default();
+    let mut target_mean = core::Scalar::default();
+    let mut target_stddev = core::Scalar::default();
+    
+    core::mean_std_dev(&src_l, &mut src_mean, &mut src_stddev, &core::Mat::default()).map_err(|e| e.to_string())?;
+    core::mean_std_dev(&target_l, &mut target_mean, &mut target_stddev, &core::Mat::default()).map_err(|e| e.to_string())?;
+
+    // 輝度チャンネルを正規化してマッチング（強度を30%に抑える）
+    let mut normalized_l = core::Mat::default();
+    src_l.convert_to(&mut normalized_l, core::CV_32F, 1.0, 0.0).map_err(|e| e.to_string())?;
+    
+    // (src_l - src_mean) * (target_std / src_std) + target_mean
+    let scale = if src_stddev[0] > 0.0 {
+        target_stddev[0] / src_stddev[0]
+    } else {
+        1.0
+    };
+    
+    let mut scaled = core::Mat::default();
+    core::subtract(&normalized_l, &core::Scalar::all(src_mean[0]), &mut scaled, &core::Mat::default(), -1).map_err(|e| e.to_string())?;
+    
+    let mut fully_matched_l = core::Mat::default();
+    scaled.convert_to(&mut fully_matched_l, core::CV_8U, scale, target_mean[0]).map_err(|e| e.to_string())?;
+    
+    // 元の輝度とマッチング後の輝度をブレンド（30%のみ適用）
+    let mut matched_l = core::Mat::default();
+    core::add_weighted(&src_l, 0.7, &fully_matched_l, 0.3, 0.0, &mut matched_l, -1).map_err(|e| e.to_string())?;
+    
+    // マッチングしたLチャンネルをセット
+    src_channels.set(0, matched_l).map_err(|e| e.to_string())?;
+    
+    // チャンネル結合
+    let mut matched_lab = core::Mat::default();
+    core::merge(&src_channels, &mut matched_lab).map_err(|e| e.to_string())?;
+    
+    // BGRに戻す
+    imgproc::cvt_color(&matched_lab, dst, imgproc::COLOR_Lab2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 // 色補正: ソース画像の肌色をターゲット画像の肌色に合わせる
 fn match_color(src: &core::Mat, target: &core::Mat, dst: &mut core::Mat, strength: f64) -> Result<(), String> {
     // 肌色を抽出（YCrCbカラースペース使用）
@@ -492,7 +556,7 @@ fn match_color(src: &core::Mat, target: &core::Mat, dst: &mut core::Mat, strengt
     Ok(())
 }
 
-// より自然なブレンディング（マルチスケールブレンディング）
+// より自然なブレンディング（高速版）
 fn blend_with_feathering(src: &core::Mat, dst: &mut core::Mat, mask: &core::Mat, x: i32, y: i32) -> Result<(), String> {
     let height = src.rows();
     let width = src.cols();
@@ -509,22 +573,40 @@ fn blend_with_feathering(src: &core::Mat, dst: &mut core::Mat, mask: &core::Mat,
         core::AlgorithmHint::ALGO_HINT_DEFAULT
     ).map_err(|e| e.to_string())?;
 
-    for row in 0..height {
-        for col in 0..width {
-            let dst_y = y + row;
-            let dst_x = x + col;
+    // マスクを3チャンネルに変換してアルファブレンディング用に準備
+    let mut mask_3ch = core::Mat::default();
+    imgproc::cvt_color(&feathered_mask, &mut mask_3ch, imgproc::COLOR_GRAY2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+    
+    let mut mask_f32 = core::Mat::default();
+    mask_3ch.convert_to(&mut mask_f32, core::CV_32F, 1.0 / 255.0, 0.0).map_err(|e| e.to_string())?;
 
-            if dst_y >= 0 && dst_y < dst.rows() && dst_x >= 0 && dst_x < dst.cols() {
-                let alpha = *feathered_mask.at_2d::<u8>(row, col).map_err(|e| e.to_string())? as f32 / 255.0;
-                let src_pixel = src.at_2d::<core::Vec3b>(row, col).map_err(|e| e.to_string())?;
-                let dst_pixel = dst.at_2d_mut::<core::Vec3b>(dst_y, dst_x).map_err(|e| e.to_string())?;
-
-                for c in 0..3 {
-                    dst_pixel[c] = (src_pixel[c] as f32 * alpha + dst_pixel[c] as f32 * (1.0 - alpha)) as u8;
-                }
-            }
-        }
-    }
+    // ROI（関心領域）を取得
+    let roi_rect = core::Rect::new(x, y, width, height);
+    let dst_roi = core::Mat::roi(dst, roi_rect).map_err(|e| e.to_string())?;
+    
+    // 高速ブレンディング: dst_roi = src * mask + dst_roi * (1 - mask)
+    let mut src_f32 = core::Mat::default();
+    let mut dst_roi_f32 = core::Mat::default();
+    src.convert_to(&mut src_f32, core::CV_32F, 1.0, 0.0).map_err(|e| e.to_string())?;
+    dst_roi.convert_to(&mut dst_roi_f32, core::CV_32F, 1.0, 0.0).map_err(|e| e.to_string())?;
+    
+    let mut src_masked = core::Mat::default();
+    core::multiply(&src_f32, &mask_f32, &mut src_masked, 1.0, -1).map_err(|e| e.to_string())?;
+    
+    let mut inv_mask = core::Mat::default();
+    core::subtract(&core::Scalar::all(1.0), &mask_f32, &mut inv_mask, &core::Mat::default(), -1).map_err(|e| e.to_string())?;
+    
+    let mut dst_masked = core::Mat::default();
+    core::multiply(&dst_roi_f32, &inv_mask, &mut dst_masked, 1.0, -1).map_err(|e| e.to_string())?;
+    
+    let mut blended_f32 = core::Mat::default();
+    core::add(&src_masked, &dst_masked, &mut blended_f32, &core::Mat::default(), -1).map_err(|e| e.to_string())?;
+    
+    let mut blended = core::Mat::default();
+    blended_f32.convert_to(&mut blended, core::CV_8U, 1.0, 0.0).map_err(|e| e.to_string())?;
+    
+    // 結果をdstにコピー
+    blended.copy_to(&mut core::Mat::roi_mut(dst, roi_rect).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
 
     Ok(())
 }
