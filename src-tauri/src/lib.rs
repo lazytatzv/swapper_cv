@@ -36,9 +36,9 @@ fn process_face(path: String) -> Result<Vec<FaceResult>, String> { // 戻り値�
         let img_size = img.size().map_err(|e| e.to_string())?;
 
         // 1. キャンバス確保 (margin設定)
-        let canvas_margin_top = (face.height as f32 * 1.5) as i32;
-        let canvas_margin_bottom = (face.height as f32 * 0.2) as i32;
-        let canvas_margin_side = (face.width as f32 * 1.5) as i32;
+        let canvas_margin_top = (face.height as f32 * 1.0) as i32;
+        let canvas_margin_bottom = (face.height as f32 * 0.05) as i32;
+        let canvas_margin_side = (face.width as f32 * 0.3) as i32;
 
         let canvas_x = (face.x - canvas_margin_side).max(0);
         let canvas_y = (face.y - canvas_margin_top).max(0);
@@ -55,7 +55,7 @@ fn process_face(path: String) -> Result<Vec<FaceResult>, String> { // 戻り値�
         // 2. ヒント枠 (AI探索範囲)
         let border = 2;
         let hint_w = (work_img.cols() - (border as f32 * 0.1) as i32).max(1);
-        let neck_exclude_px = (face.height as f32 * 0.2) as i32; 
+        let neck_exclude_px = (face.height as f32 * 0.05) as i32; 
         let hint_h = (work_img.rows() - border - neck_exclude_px).max(1);
         let hint_rect = core::Rect::new(border, border, hint_w, hint_h);
 
@@ -133,7 +133,7 @@ fn create_high_quality_mask(img: &core::Mat, rect: core::Rect) -> Result<core::M
     let mut fgd = core::Mat::default();
 
     // GrabCut実行
-    imgproc::grab_cut(img, &mut mask, rect, &mut bgd, &mut fgd, 15, imgproc::GC_INIT_WITH_RECT).map_err(|e| e.to_string())?;
+    imgproc::grab_cut(img, &mut mask, rect, &mut bgd, &mut fgd, 20, imgproc::GC_INIT_WITH_RECT).map_err(|e| e.to_string())?;
 
     let mut mask_fg = core::Mat::default();
     let mut mask_pr = core::Mat::default();
