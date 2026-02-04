@@ -36,9 +36,9 @@ fn process_face(path: String) -> Result<Vec<FaceResult>, String> { // 戻り値�
         let img_size = img.size().map_err(|e| e.to_string())?;
 
         // 1. キャンバス確保 (margin設定)
-        let canvas_margin_top = (face.height as f32 * 1.0) as i32;
-        let canvas_margin_bottom = (face.height as f32 * 0.05) as i32;
-        let canvas_margin_side = (face.width as f32 * 0.3) as i32;
+        let canvas_margin_top = (face.height as f32 * 1.0) as i32;     // 髪全体を含める
+        let canvas_margin_bottom = (face.height as f32 * 0.2) as i32;  // 首は最小限
+        let canvas_margin_side = (face.width as f32 * 0.3) as i32;     // 横髪も含める
 
         let canvas_x = (face.x - canvas_margin_side).max(0);
         let canvas_y = (face.y - canvas_margin_top).max(0);
@@ -52,12 +52,16 @@ fn process_face(path: String) -> Result<Vec<FaceResult>, String> { // 戻り値�
         let mut work_img = core::Mat::default();
         canvas_roi.copy_to(&mut work_img).map_err(|e| e.to_string())?;
 
-        // 2. ヒント枠 (AI探索範囲)
-        let border = 2;
-        let hint_w = (work_img.cols() - (border as f32 * 0.1) as i32).max(1);
-        let neck_exclude_px = (face.height as f32 * 0.05) as i32; 
-        let hint_h = (work_img.rows() - border - neck_exclude_px).max(1);
-        let hint_rect = core::Rect::new(border, border, hint_w, hint_h);
+        // 2. ヒント枠 (AI探索範囲) - 顔と髪の中心部分に限定
+        let hint_margin_x = (face.width as f32 * 0.15) as i32;   // 左右から15%除外（耳周辺を除外）
+        let hint_margin_top = (face.height as f32 * 0.05) as i32; // 上部から5%除外
+        let hint_margin_bottom = (face.height as f32 * 0.3) as i32; // 下部から30%除外（顎を残しつつ首を除外）
+        
+        let hint_x = hint_margin_x;
+        let hint_y = hint_margin_top;
+        let hint_w = (work_img.cols() - hint_margin_x * 2).max(1);
+        let hint_h = (work_img.rows() - hint_margin_top - hint_margin_bottom).max(1);
+        let hint_rect = core::Rect::new(hint_x, hint_y, hint_w, hint_h);
 
         // --- ★ここが追加: デバッグ画像の作成 ---
         let mut debug_img = work_img.clone();
@@ -132,8 +136,8 @@ fn create_high_quality_mask(img: &core::Mat, rect: core::Rect) -> Result<core::M
     let mut bgd = core::Mat::default();
     let mut fgd = core::Mat::default();
 
-    // GrabCut実行
-    imgproc::grab_cut(img, &mut mask, rect, &mut bgd, &mut fgd, 20, imgproc::GC_INIT_WITH_RECT).map_err(|e| e.to_string())?;
+    // GrabCut実行（反復回数を増やして精度向上）
+    imgproc::grab_cut(img, &mut mask, rect, &mut bgd, &mut fgd, 5, imgproc::GC_INIT_WITH_RECT).map_err(|e| e.to_string())?;
 
     let mut mask_fg = core::Mat::default();
     let mut mask_pr = core::Mat::default();
@@ -142,12 +146,19 @@ fn create_high_quality_mask(img: &core::Mat, rect: core::Rect) -> Result<core::M
     let mut bin = core::Mat::default();
     core::bitwise_or(&mask_fg, &mask_pr, &mut bin, &core::Mat::default()).map_err(|e| e.to_string())?;
 
-    let mut smooth = core::Mat::default();
-    let k_open = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(3, 3), core::Point::new(-1, -1)).map_err(|e| e.to_string())?;
+    // モルフォロジー演算でノイズ除去（最小限の処理）
     let mut temp = core::Mat::default();
+    let k_open = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(3, 3), core::Point::new(-1, -1)).map_err(|e| e.to_string())?;
     imgproc::morphology_ex(&bin, &mut temp, imgproc::MORPH_OPEN, &k_open, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, core::Scalar::default()).map_err(|e| e.to_string())?;
-    let k_close = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(9, 9), core::Point::new(-1, -1)).map_err(|e| e.to_string())?;
-    imgproc::morphology_ex(&temp, &mut smooth, imgproc::MORPH_CLOSE, &k_close, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, core::Scalar::default()).map_err(|e| e.to_string())?;
+    
+    let mut closed = core::Mat::default();
+    let k_close = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(5, 5), core::Point::new(-1, -1)).map_err(|e| e.to_string())?;
+    imgproc::morphology_ex(&temp, &mut closed, imgproc::MORPH_CLOSE, &k_close, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, core::Scalar::default()).map_err(|e| e.to_string())?;
+    
+    // マスクのエッジのみを滑らかに（最小限のガウシアンブラー）
+    let mut smooth = core::Mat::default();
+    imgproc::gaussian_blur(&closed, &mut smooth, core::Size::new(3, 3), 0.5, 0.0, core::BORDER_DEFAULT, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+    
     Ok(smooth)
 }
 
@@ -203,12 +214,175 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+#[derive(serde::Serialize)]
+struct FaceSwapResult {
+    base64: String,  // 合成結果画像
+}
+
+#[tauri::command]
+fn face_swap(source_path: String, target_path: String) -> Result<FaceSwapResult, String> {
+    opencv::core::set_use_optimized(true).ok();
+    opencv::core::set_num_threads(0).ok();
+
+    // 画像読み込み
+    let source_img = imgcodecs::imread(&source_path, imgcodecs::IMREAD_COLOR)
+        .map_err(|_| "ソース画像の読み込みに失敗")?;
+    let target_img = imgcodecs::imread(&target_path, imgcodecs::IMREAD_COLOR)
+        .map_err(|_| "ターゲット画像の読み込みに失敗")?;
+
+    // 顔検出
+    let source_faces = detect_faces(&source_img)?;
+    let target_faces = detect_faces(&target_img)?;
+
+    if source_faces.is_empty() {
+        return Err("ソース画像に顔が検出されませんでした".to_string());
+    }
+    if target_faces.is_empty() {
+        return Err("ターゲット画像に顔が検出されませんでした".to_string());
+    }
+
+    let source_face = source_faces.get(0).map_err(|e| e.to_string())?;
+    let target_face = target_faces.get(0).map_err(|e| e.to_string())?;
+
+    // ソース顔を検出矩形で切り抜き（顔だけ）
+    let source_face_roi = core::Mat::roi(&source_img, source_face).map_err(|e| e.to_string())?;
+    let mut source_face_img = core::Mat::default();
+    source_face_roi.copy_to(&mut source_face_img).map_err(|e| e.to_string())?;
+
+    // ソース顔をターゲット顔のサイズにリサイズ
+    let mut resized_face = core::Mat::default();
+    imgproc::resize(
+        &source_face_img, 
+        &mut resized_face, 
+        core::Size::new(target_face.width, target_face.height), 
+        0.0, 0.0, 
+        imgproc::INTER_LANCZOS4
+    ).map_err(|e| e.to_string())?;
+
+    // 楽円マスクを作成（顔全体を滑らかに合成）
+    let mask = create_ellipse_mask(target_face.width, target_face.height)?;
+
+    // ターゲット画像のコピーを作成
+    let mut result = target_img.clone();
+
+    // ターゲット顔の位置に直接ブレンド
+    blend_with_mask(&resized_face, &mut result, &mask, target_face.x, target_face.y)?;
+
+    // エンコード
+    let mut buf = core::Vector::<u8>::new();
+    imgcodecs::imencode(".png", &result, &mut buf, &core::Vector::new())
+        .map_err(|e| e.to_string())?;
+
+    Ok(FaceSwapResult {
+        base64: general_purpose::STANDARD.encode(buf.as_slice()),
+    })
+}
+
+fn extract_face_with_mask(img: &core::Mat, face: &core::Rect) -> Result<(core::Mat, core::Mat), String> {
+    let img_size = img.size().map_err(|e| e.to_string())?;
+
+    // キャンバス確保
+    let canvas_margin_top = (face.height as f32 * 1.0) as i32;
+    let canvas_margin_bottom = (face.height as f32 * 0.2) as i32;
+    let canvas_margin_side = (face.width as f32 * 0.3) as i32;
+
+    let canvas_x = (face.x - canvas_margin_side).max(0);
+    let canvas_y = (face.y - canvas_margin_top).max(0);
+    let canvas_w = (face.width + canvas_margin_side * 2).min(img_size.width - canvas_x);
+    let canvas_h = (face.height + canvas_margin_top + canvas_margin_bottom).min(img_size.height - canvas_y);
+
+    let canvas_rect = core::Rect::new(canvas_x, canvas_y, canvas_w, canvas_h);
+    let canvas_roi = core::Mat::roi(img, canvas_rect).map_err(|e| e.to_string())?;
+    let mut face_img = core::Mat::default();
+    canvas_roi.copy_to(&mut face_img).map_err(|e| e.to_string())?;
+
+    // ヒント枠
+    let hint_margin_x = (face.width as f32 * 0.15) as i32;
+    let hint_margin_top = (face.height as f32 * 0.05) as i32;
+    let hint_margin_bottom = (face.height as f32 * 0.3) as i32;
+    
+    let hint_x = hint_margin_x;
+    let hint_y = hint_margin_top;
+    let hint_w = (face_img.cols() - hint_margin_x * 2).max(1);
+    let hint_h = (face_img.rows() - hint_margin_top - hint_margin_bottom).max(1);
+    let hint_rect = core::Rect::new(hint_x, hint_y, hint_w, hint_h);
+
+    // マスク生成
+    let mask = create_high_quality_mask(&face_img, hint_rect)?;
+
+    Ok((face_img, mask))
+}
+
+// 楽円マスクを作成（face swap用）
+fn create_ellipse_mask(width: i32, height: i32) -> Result<core::Mat, String> {
+    let mut mask = core::Mat::new_size_with_default(
+        core::Size::new(width, height),
+        core::CV_8UC1,
+        core::Scalar::all(0.0)
+    ).map_err(|e| e.to_string())?;
+
+    let center = core::Point::new(width / 2, height / 2);
+    let axes = core::Size::new((width as f32 * 0.45) as i32, (height as f32 * 0.45) as i32);
+    
+    // 白い楽円を描画
+    imgproc::ellipse(
+        &mut mask,
+        center,
+        axes,
+        0.0,
+        0.0,
+        360.0,
+        core::Scalar::all(255.0),
+        -1,
+        imgproc::LINE_8,
+        0
+    ).map_err(|e| e.to_string())?;
+
+    // エッジを軽く滑らかに（カーネルサイズを小さく）
+    let mut smooth_mask = core::Mat::default();
+    imgproc::gaussian_blur(
+        &mask,
+        &mut smooth_mask,
+        core::Size::new(5, 5),
+        2.0,
+        0.0,
+        core::BORDER_DEFAULT,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT
+    ).map_err(|e| e.to_string())?;
+
+    Ok(smooth_mask)
+}
+
+fn blend_with_mask(src: &core::Mat, dst: &mut core::Mat, mask: &core::Mat, x: i32, y: i32) -> Result<(), String> {
+    let height = src.rows();
+    let width = src.cols();
+
+    for row in 0..height {
+        for col in 0..width {
+            let dst_y = y + row;
+            let dst_x = x + col;
+
+            if dst_y >= 0 && dst_y < dst.rows() && dst_x >= 0 && dst_x < dst.cols() {
+                let alpha = *mask.at_2d::<u8>(row, col).map_err(|e| e.to_string())? as f32 / 255.0;
+                let src_pixel = src.at_2d::<core::Vec3b>(row, col).map_err(|e| e.to_string())?;
+                let dst_pixel = dst.at_2d_mut::<core::Vec3b>(dst_y, dst_x).map_err(|e| e.to_string())?;
+
+                for c in 0..3 {
+                    dst_pixel[c] = (src_pixel[c] as f32 * alpha + dst_pixel[c] as f32 * (1.0 - alpha)) as u8;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![greet, process_face])
+        .invoke_handler(tauri::generate_handler![greet, process_face, face_swap])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
