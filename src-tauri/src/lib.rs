@@ -249,6 +249,11 @@ fn face_swap(source_path: String, target_path: String) -> Result<FaceSwapResult,
     let mut source_face_img = core::Mat::default();
     source_face_roi.copy_to(&mut source_face_img).map_err(|e| e.to_string())?;
 
+    // ターゲット顔も切り抜き（色補正用）
+    let target_face_roi = core::Mat::roi(&target_img, target_face).map_err(|e| e.to_string())?;
+    let mut target_face_img = core::Mat::default();
+    target_face_roi.copy_to(&mut target_face_img).map_err(|e| e.to_string())?;
+
     // ソース顔をターゲット顔のサイズにリサイズ
     let mut resized_face = core::Mat::default();
     imgproc::resize(
@@ -259,6 +264,10 @@ fn face_swap(source_path: String, target_path: String) -> Result<FaceSwapResult,
         imgproc::INTER_LANCZOS4
     ).map_err(|e| e.to_string())?;
 
+    // 色補正: ソース顔の色をターゲット顔に合わせる
+    let mut color_corrected = core::Mat::default();
+    match_color(&resized_face, &target_face_img, &mut color_corrected)?;
+
     // 楽円マスクを作成（顔全体を滑らかに合成）
     let mask = create_ellipse_mask(target_face.width, target_face.height)?;
 
@@ -266,7 +275,7 @@ fn face_swap(source_path: String, target_path: String) -> Result<FaceSwapResult,
     let mut result = target_img.clone();
 
     // ターゲット顔の位置に直接ブレンド
-    blend_with_mask(&resized_face, &mut result, &mask, target_face.x, target_face.y)?;
+    blend_with_mask(&color_corrected, &mut result, &mask, target_face.x, target_face.y)?;
 
     // エンコード
     let mut buf = core::Vector::<u8>::new();
@@ -322,7 +331,7 @@ fn create_ellipse_mask(width: i32, height: i32) -> Result<core::Mat, String> {
     ).map_err(|e| e.to_string())?;
 
     let center = core::Point::new(width / 2, height / 2);
-    let axes = core::Size::new((width as f32 * 0.45) as i32, (height as f32 * 0.45) as i32);
+    let axes = core::Size::new((width as f32 * 0.42) as i32, (height as f32 * 0.42) as i32);
     
     // 白い楽円を描画
     imgproc::ellipse(
@@ -338,19 +347,63 @@ fn create_ellipse_mask(width: i32, height: i32) -> Result<core::Mat, String> {
         0
     ).map_err(|e| e.to_string())?;
 
-    // エッジを軽く滑らかに（カーネルサイズを小さく）
+    // エッジを適度にぼかす（境界を自然に）
     let mut smooth_mask = core::Mat::default();
     imgproc::gaussian_blur(
         &mask,
         &mut smooth_mask,
-        core::Size::new(5, 5),
-        2.0,
+        core::Size::new(7, 7),
+        3.0,
         0.0,
         core::BORDER_DEFAULT,
         core::AlgorithmHint::ALGO_HINT_DEFAULT
     ).map_err(|e| e.to_string())?;
 
     Ok(smooth_mask)
+}
+
+// 色補正: ソース画像の肌色をターゲット画像の肌色に合わせる
+fn match_color(src: &core::Mat, target: &core::Mat, dst: &mut core::Mat) -> Result<(), String> {
+    // 肌色を抽出（YCrCbカラースペース使用）
+    let mut src_ycrcb = core::Mat::default();
+    let mut target_ycrcb = core::Mat::default();
+    imgproc::cvt_color(src, &mut src_ycrcb, imgproc::COLOR_BGR2YCrCb, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+    imgproc::cvt_color(target, &mut target_ycrcb, imgproc::COLOR_BGR2YCrCb, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).map_err(|e| e.to_string())?;
+
+    // 肌色範囲でマスクを作成（Cr: 133-173, Cb: 77-127 あたりが肌色）
+    let mut src_skin_mask = core::Mat::default();
+    let mut target_skin_mask = core::Mat::default();
+    let lower_skin = core::Scalar::new(0.0, 133.0, 77.0, 0.0);
+    let upper_skin = core::Scalar::new(255.0, 173.0, 127.0, 0.0);
+    
+    core::in_range(&src_ycrcb, &lower_skin, &upper_skin, &mut src_skin_mask).map_err(|e| e.to_string())?;
+    core::in_range(&target_ycrcb, &lower_skin, &upper_skin, &mut target_skin_mask).map_err(|e| e.to_string())?;
+
+    // 肌色領域の平均色を計算
+    let src_skin_mean = core::mean(src, &src_skin_mask).map_err(|e| e.to_string())?;
+    let target_skin_mean = core::mean(target, &target_skin_mask).map_err(|e| e.to_string())?;
+
+    // 肌色の差分を計算（40%の強度で穏やかに補正）
+    let color_shift = [
+        (target_skin_mean[0] - src_skin_mean[0]) * 0.4,
+        (target_skin_mean[1] - src_skin_mean[1]) * 0.4,
+        (target_skin_mean[2] - src_skin_mean[2]) * 0.4,
+    ];
+
+    // 変換後の画像を作成
+    src.copy_to(dst).map_err(|e| e.to_string())?;
+    
+    // 各ピクセルに色差分を加算
+    let mut dst_f32 = core::Mat::default();
+    dst.convert_to(&mut dst_f32, core::CV_32F, 1.0, 0.0).map_err(|e| e.to_string())?;
+    
+    let scalar_shift = core::Scalar::new(color_shift[0], color_shift[1], color_shift[2], 0.0);
+    let mut shifted = core::Mat::default();
+    core::add(&dst_f32, &scalar_shift, &mut shifted, &core::Mat::default(), -1).map_err(|e| e.to_string())?;
+    
+    shifted.convert_to(dst, core::CV_8U, 1.0, 0.0).map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 fn blend_with_mask(src: &core::Mat, dst: &mut core::Mat, mask: &core::Mat, x: i32, y: i32) -> Result<(), String> {
